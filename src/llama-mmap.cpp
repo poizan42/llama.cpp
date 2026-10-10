@@ -636,8 +636,21 @@ struct llama_mmap::impl {
     }
 
     void unmap_fragment(size_t first, size_t last) {
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
+        // a view cannot be partly unmapped, but VirtualUnlock on pages that are not locked removes them from the working set
+        // they go to the standby list, so the RAM can be reused, e.g. after offloaded tensors were copied to the device
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        const size_t page_size = si.dwPageSize;
+
+        // only whole pages inside [first, last), so the pages of the tensors that stay mapped are kept
+        first = (first + page_size - 1) & ~(page_size - 1);
+        last  = last & ~(page_size - 1);
+        if (last <= first) {
+            return;
+        }
+
+        // fails with ERROR_NOT_LOCKED when the pages are not locked, which is the expected case
+        VirtualUnlock((uint8_t *) addr + first, last - first);
     }
 
     ~impl() {
