@@ -48,6 +48,13 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
+
+        // weight at an explicit file offset, e.g. a row slice of another weight
+        llama_tensor_weight(const llama_file * file, uint16_t idx, size_t offs, ggml_tensor * tensor) : idx(idx), offs(offs), tensor(tensor) {
+            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
+                throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
+            }
+        }
     };
 
     // custom comparator to sort weights more nicely by layer
@@ -132,6 +139,7 @@ struct llama_model_loader {
     llama_model_set_tensor_data_t set_tensor_data;
     void * set_tensor_data_ud;
     std::vector<ggml_context_ptr> contexts;
+    std::vector<ggml_context_ptr> split_contexts; // meta tensors made by split_weight_rows()
 
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
@@ -227,6 +235,13 @@ struct llama_model_loader {
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 
     struct ggml_tensor * require_tensor_meta(const std::string & name) const;
+
+    // first tensor buffer type override whose pattern matches name, or nullptr
+    const llama_model_tensor_buft_override * find_tensor_buft_override(const std::string & name) const;
+
+    // replace a 2D weight with row slices [begin, end) that are loaded as separate weights
+    // use it to keep each tensor under a backend's max buffer size; call it before create_tensor() of the slices
+    void split_weight_rows(const std::string & name, const std::vector<std::pair<int64_t, int64_t>> & row_ranges, const std::vector<std::string> & names);
 
     const struct ggml_tensor * check_tensor_dims(
             const std::string & name,

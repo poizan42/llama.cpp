@@ -179,6 +179,49 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
+    // flat [ple_head_dim, n_rows] gather target; first, since splitting it adds tensors that the loader contexts are sized for
+    if (hparams.ple_n_heads > 0) {
+        // the head ranges are what the gather indexes, so they set the minimum row count
+        int64_t ple_rows = 0;
+        for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+            ple_rows = std::max(ple_rows, (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
+        }
+
+        // the converter pads the table; a model synthesised from metadata has no tensor to ask
+        const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+        const auto * ple_w = ml.get_weight(ple_name.c_str());
+        if (ple_w) {
+            if (ple_w->tensor->ne[1] < ple_rows) {
+                throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
+                                                ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
+            }
+            ple_rows = ple_w->tensor->ne[1];
+        }
+
+        // a buffer override to a device puts the table there, so cut it into one tensor per head
+        // the whole table can be larger than the max buffer size of the device (2 GiB on some Vulkan drivers)
+        // not for host buffers: with mmap the parts would point into the file at row offsets that are not aligned
+        const auto * ple_ovr = ple_w ? ml.find_tensor_buft_override(ple_name) : nullptr;
+        if (ple_ovr && !ggml_backend_buft_is_host(ple_ovr->buft)) {
+            std::vector<std::pair<int64_t, int64_t>> ranges;
+            std::vector<std::string> names;
+            for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+                const int64_t r0 = hparams.ple_head_offsets[h];
+                ranges.emplace_back(r0, r0 + hparams.ple_head_vocab_sizes[h]);
+                names.push_back(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD_PART, "weight", h).str());
+            }
+            ml.split_weight_rows(ple_name, ranges, names);
+
+            for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+                per_layer_tok_embd_parts.push_back(create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD_PART, "weight", h),
+                                                                 { hparams.ple_head_dim, hparams.ple_head_vocab_sizes[h] }, 0));
+            }
+        } else {
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                               { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        }
+    }
+
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
     // there is no output_norm: the final hyper-connection mixer carries it
@@ -190,28 +233,6 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
     if (output == NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
-    }
-
-    // flat [ple_head_dim, n_rows] gather target
-    if (hparams.ple_n_heads > 0) {
-        // the head ranges are what the gather indexes, so they set the minimum row count
-        int64_t ple_rows = 0;
-        for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
-            ple_rows = std::max(ple_rows, (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
-        }
-
-        // the converter pads the table; a model synthesised from metadata has no tensor to ask
-        const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
-            if (ple_w->tensor->ne[1] < ple_rows) {
-                throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
-                                                ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
-            }
-            ple_rows = ple_w->tensor->ne[1];
-        }
-
-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
     }
 
     auto load_block = [&](int il, int flags) {
@@ -1239,6 +1260,9 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
 
     std::vector<int32_t> idx(n_heads * n_tokens);
 
+    // split table: rows are local to each head's tensor and laid out head-major, so each head gathers from a contiguous view
+    const bool split = !model.per_layer_tok_embd_parts.empty();
+
     GGML_ASSERT(mctx != nullptr);
 
     for (int64_t i = 0; i < n_tokens; ++i) {
@@ -1271,13 +1295,17 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
             const int64_t base = (n - 2) * per_gram;
             for (int64_t g = 0; g < per_gram; ++g) {
                 const int64_t h_i = base + g;
-                idx[i * n_heads + h_i] =
-                    (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
+                if (split) {
+                    idx[h_i * n_tokens + i] = (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i]);
+                } else {
+                    idx[i * n_heads + h_i] =
+                        (int32_t) (mixed % hparams.ple_head_vocab_sizes[h_i] + hparams.ple_head_offsets[h_i]);
+                }
             }
         }
     }
 
-    {
+    if (!split) {
         ggml_tensor * ple = model.per_layer_tok_embd;
 
         const bool prefetch = model.can_prefetch.count(ple);
@@ -1357,8 +1385,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     ggml_tensor * rows = ple_inp->rows;
     res->add_input(std::move(ple_inp));
 
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_tensor * emb = nullptr;
+    if (model.per_layer_tok_embd_parts.empty()) {
+        // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    } else {
+        // one gather per head part, each [head_dim, 1, n_tokens], then join them along dim 1 into [head_dim, n_heads, n_tokens]
+        // the result has the same layout as the single gather above
+        std::vector<ggml_tensor *> parts;
+        for (int64_t h = 0; h < n_heads; ++h) {
+            ggml_tensor * rows_h = ggml_view_1d(ctx0, rows, n_tokens, h * n_tokens * ggml_element_size(rows));
+            ggml_tensor * cur = ggml_get_rows(ctx0, model.per_layer_tok_embd_parts[h], rows_h);
+            parts.push_back(ggml_reshape_3d(ctx0, cur, hparams.ple_head_dim, 1, n_tokens));
+        }
+        // pairwise joins copy each row log2(n_heads) times instead of n_heads times
+        while (parts.size() > 1) {
+            std::vector<ggml_tensor *> next;
+            for (size_t i = 0; i + 1 < parts.size(); i += 2) {
+                next.push_back(ggml_concat(ctx0, parts[i], parts[i + 1], 1));
+            }
+            if (parts.size() % 2) {
+                next.push_back(parts.back());
+            }
+            parts = std::move(next);
+        }
+        emb = parts[0];
+    }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 

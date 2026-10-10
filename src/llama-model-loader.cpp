@@ -877,6 +877,67 @@ struct ggml_tensor * llama_model_loader::require_tensor_meta(const std::string &
     return tensor;
 }
 
+const llama_model_tensor_buft_override * llama_model_loader::find_tensor_buft_override(const std::string & name) const {
+    if (!tensor_buft_overrides) {
+        return nullptr;
+    }
+    for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
+        std::regex pattern(overrides->pattern);
+        if (std::regex_search(name, pattern)) {
+            return overrides;
+        }
+    }
+    return nullptr;
+}
+
+void llama_model_loader::split_weight_rows(
+        const std::string & name, const std::vector<std::pair<int64_t, int64_t>> & row_ranges, const std::vector<std::string> & names) {
+    GGML_ASSERT(row_ranges.size() == names.size());
+
+    const auto it = weights_map.find(name);
+    if (it == weights_map.end()) {
+        throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name.c_str()));
+    }
+    const llama_tensor_weight parent = it->second;
+    const ggml_tensor * t = parent.tensor;
+    if (!ggml_is_matrix(t)) {
+        throw std::runtime_error(format("%s: tensor '%s' is not 2D", __func__, name.c_str()));
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*names.size(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        throw std::runtime_error(format("failed to create ggml context"));
+    }
+    split_contexts.emplace_back(ctx);
+
+    for (size_t i = 0; i < names.size(); ++i) {
+        const auto [r0, r1] = row_ranges[i];
+        if (r0 < 0 || r0 >= r1 || r1 > t->ne[1]) {
+            throw std::runtime_error(format("%s: rows [%" PRId64 ", %" PRId64 ") are not within tensor '%s' (%" PRId64 " rows)",
+                                            __func__, r0, r1, name.c_str(), t->ne[1]));
+        }
+
+        ggml_tensor * part = ggml_new_tensor_2d(ctx, t->type, t->ne[0], r1 - r0);
+        ggml_set_name(part, names[i].c_str());
+
+        const size_t offs = parent.offs + (size_t) r0*t->nb[1];
+        const auto res = weights_map.emplace(names[i], llama_tensor_weight(files.at(parent.idx).get(), parent.idx, offs, part));
+        if (!res.second) {
+            throw std::runtime_error(format("%s: tensor '%s' already exists", __func__, names[i].c_str()));
+        }
+    }
+
+    weights_map.erase(name);
+    n_tensors += (int) names.size() - 1;
+
+    LLAMA_LOG_INFO("%s: split tensor %s (size = %zu MiB) into %zu parts\n", __func__, name.c_str(), ggml_nbytes(t)/1024/1024, names.size());
+}
+
 const struct ggml_tensor * llama_model_loader::check_tensor_dims(
         const std::string & name,
         const std::vector<int64_t> & ne,
@@ -1199,7 +1260,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // sanity checks
         if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
-            if (tn.bid != -1) {
+            // PLE parts use bid as the part index
+            if (tn.bid != -1 && tn.tensor != LLM_TENSOR_PER_LAYER_TOKEN_EMBD_PART) {
                 GGML_ABORT("input/output layer tensor %s used with a layer number", tn.str().c_str());
             }
         } else {
@@ -1234,28 +1296,29 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // check overrides
         if (tensor_buft_overrides) {
             std::string tensor_name = tn.str();
-            for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
-                std::regex pattern(overrides->pattern);
-                if (std::regex_search(tensor_name, pattern)) {
-                    if (overrides->buft == ggml_backend_cpu_buffer_type()) {
-                        // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
-                        if (use_mmap) {
-                            static std::once_flag once;
-                            std::call_once(once, [] {
-                                LLAMA_LOG_WARN("llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance\n");
-                            });
-                        }
-                    } else {
-                        buft = overrides->buft;
+            const auto * overrides = find_tensor_buft_override(tensor_name);
+            if (!overrides && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD_PART) {
+                // a pattern written for the whole PLE table also applies to its parts
+                overrides = find_tensor_buft_override(LLM_TN_IMPL(tn.arch, LLM_TENSOR_PER_LAYER_TOKEN_EMBD, tn.suffix, -1, -1).str());
+            }
+            if (overrides) {
+                if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                    // when overriding to a CPU buffer, consider the extra buffer types
+                    buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                    if (use_mmap) {
+                        static std::once_flag once;
+                        std::call_once(once, [] {
+                            LLAMA_LOG_WARN("llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance\n");
+                        });
                     }
-
-                    LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
-                            tensor_name.c_str(),
-                            ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
-                            ggml_backend_buft_name(buft));
-                    break;
+                } else {
+                    buft = overrides->buft;
                 }
+
+                LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
+                        tensor_name.c_str(),
+                        ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                        ggml_backend_buft_name(buft));
             }
         }
 

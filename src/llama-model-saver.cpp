@@ -10,6 +10,7 @@
 #include "llama-vocab.h"
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
@@ -494,6 +495,10 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->hc_head_fn);
     add_tensor(model->hc_head_base);
     add_tensor(model->hc_head_scale);
+    if (!model->per_layer_tok_embd_parts.empty()) {
+        // the loader expects the whole table in the file
+        throw std::runtime_error("saving a model with a split per_layer_token_embd is not supported");
+    }
     add_tensor(model->per_layer_tok_embd);
     add_tensor(model->hc_head_norm);
     add_tensor(model->hc_head_down);

@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <random>
 #include <regex>
 #include <stdexcept>
@@ -871,9 +872,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         llama_split_mode                split_mode;
         bool                            host_experts; // keep the experts in host memory, see host_experts_test
         size_t                          moe_cache_size;
+        bool                            ple_split; // override the PLE table to the device, so a loaded file splits it per head
 
-        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, bool host_experts = false, size_t moe_cache_size = 0)
-            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), host_experts(host_experts), moe_cache_size(moe_cache_size) {}
+        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, bool host_experts = false, size_t moe_cache_size = 0, bool ple_split = false)
+            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), host_experts(host_experts), moe_cache_size(moe_cache_size), ple_split(ple_split) {}
     };
 
     const llama_model_tensor_buft_override host_experts_overrides[] = {
@@ -894,6 +896,14 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 }
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, ggml_backend_dev_description(dev), LLAMA_SPLIT_MODE_LAYER);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+
+                // only the roundtrip loads a real file, so only it checks the split table, against the unsplit one
+                // the table is split only for a device buffer
+                if (!ggml_backend_buft_is_host(ggml_backend_dev_buffer_type(dev))) {
+                    dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, std::string(ggml_backend_dev_description(dev)) + ", PLE split",
+                                             LLAMA_SPLIT_MODE_LAYER, false, 0, true);
+                    max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
+                }
 
                 // cpu-based devices cannot be used in tensor split mode
                 if (ggml_backend_dev_buffer_type(dev) != ggml_backend_cpu_buffer_type()) {
@@ -984,7 +994,17 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 if (dc.host_experts && (!moe || !host_experts_test(arch))) {
                     continue;
                 }
+                if (dc.ple_split && arch != LLM_ARCH_QWEN4EXP) {
+                    continue;
+                }
+                const llama_model_tensor_buft_override ple_split_overrides[] = {
+                    { "per_layer_token_embd", dc.ple_split ? ggml_backend_dev_buffer_type(dc.devs[0]) : nullptr },
+                    { nullptr, nullptr },
+                };
                 const llama_model_tensor_buft_override * overrides = dc.host_experts ? host_experts_overrides : nullptr;
+                if (dc.ple_split) {
+                    overrides = ple_split_overrides;
+                }
 
                 // print test config first; should anything fail during model loading or inference, at least we know which test case caused it
                 LOG(template_row_cfg.c_str(), llm_arch_name(arch), dc.label.c_str(), config_name.c_str());
@@ -1063,6 +1083,11 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     }
 
                     FILE * file = tmpfile(); // Can be null on Windows without administrator privileges.
+                    std::string tmp_path;
+                    if (file == nullptr) {
+                        tmp_path = (std::filesystem::temp_directory_path() / ("test-llama-archs-" + std::to_string(seed) + ".gguf")).string();
+                        file = fopen(tmp_path.c_str(), "w+b");
+                    }
                     // FIXME: when adding a tensor to a gguf_context a copy is made, this changes the pointer which the meta backend
                     //     in turn uses to map the tensors to their simple equivalents - this is fundamentally incompatible
                     if (file != nullptr && llama_model_saver_supports_arch(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
@@ -1086,6 +1111,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                                 break;
                             }
                         }
+                    }
+                    if (file != nullptr && !tmp_path.empty()) {
+                        fclose(file);
+                        std::remove(tmp_path.c_str());
                     }
                 }
 
