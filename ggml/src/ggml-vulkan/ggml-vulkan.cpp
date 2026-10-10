@@ -16372,7 +16372,7 @@ void vk_queue_handle_synchronized::submit(vk::ArrayProxy<const vk::SubmitInfo> s
     }
     std::lock_guard<std::mutex> guard(mutex);
     try {
-        queue.submit(submits, fence);
+        ggml_vk_retry_on_oom("vkQueueSubmit", [&] { queue.submit(submits, fence); });
     } catch (vk::DeviceLostError &) {
         if (auto dev = device.lock()) {
             ggml_vk_print_device_lost_info(dev);
@@ -16388,7 +16388,7 @@ void vk_queue_handle_unsynchronized::submit(vk::ArrayProxy<const vk::SubmitInfo>
         device_guard = std::unique_lock<std::mutex>(*device_submit_mutex);
     }
     try {
-        queue.submit(submits, fence);
+        ggml_vk_retry_on_oom("vkQueueSubmit", [&] { queue.submit(submits, fence); });
     } catch (vk::DeviceLostError &) {
         if (auto dev = device.lock()) {
             ggml_vk_print_device_lost_info(dev);

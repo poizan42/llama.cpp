@@ -1,6 +1,8 @@
 #pragma once
 #include "ggml-vulkan-push-constants.h"
 
+#include <functional>
+
 // shared globals
 extern ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface;
 extern bool vk_memory_logger_enabled;
@@ -38,6 +40,9 @@ bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_f
 bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16, ggml_type v_type = GGML_TYPE_F16);
 
 // buffers
+// run f, and if it fails with out of memory, wait and run it again (Windows only)
+// a commit-limit failure can clear once Windows has grown the pagefile; a failed vkQueueSubmit leaves its resources unchanged
+void ggml_vk_retry_on_oom(const char * what, const std::function<void()> & f);
 vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::MemoryPropertyFlags req_flags, vk::MemoryPropertyFlags fallback_flags = vk::MemoryPropertyFlags(0));
 vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size);
 void ggml_vk_destroy_buffer(vk_buffer& buf);

@@ -1,5 +1,45 @@
 #include "ggml-vulkan-common.h"
 
+#include <chrono>
+#include <thread>
+
+void ggml_vk_retry_on_oom(const char * what, const std::function<void()> & f) {
+#ifdef _WIN32
+    // GPU memory is charged to the Windows commit limit, and Windows grows the pagefile only after an allocation fails
+    // 8 retries wait 50 ms, doubling, about 12.8 s in total
+    constexpr int max_retries = 8;
+#else
+    constexpr int max_retries = 0;
+#endif
+    for (int i = 0; ; ++i) {
+        try {
+            f();
+            if (i > 0) {
+                GGML_LOG_INFO("ggml_vulkan: %s succeeded after %d retries\n", what, i);
+            }
+            return;
+        } catch (const vk::OutOfDeviceMemoryError &) {
+            if (i >= max_retries) {
+                throw;
+            }
+        } catch (const vk::OutOfHostMemoryError &) {
+            if (i >= max_retries) {
+                throw;
+            }
+        }
+        const int delay_ms = 50 << i;
+        GGML_LOG_WARN("ggml_vulkan: %s failed with out of memory, retry %d/%d in %d ms\n", what, i + 1, max_retries, delay_ms);
+#ifdef _WIN32
+        // a commit failure inside the driver does not make Windows grow the pagefile, a commit request by the process does
+        constexpr size_t probe_size = 1ull*1024*1024*1024;
+        if (void * probe = VirtualAlloc(nullptr, probe_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)) {
+            VirtualFree(probe, 0, MEM_RELEASE);
+        }
+#endif
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+    }
+}
+
 ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
     /* .get_name            = */ ggml_backend_vk_buffer_type_name,
     /* .alloc_buffer        = */ ggml_backend_vk_buffer_type_alloc_buffer,
@@ -23,6 +63,20 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
         }
     }
     return indices;
+}
+
+// true if the heap of the memory type has budget left for size, so an allocation failure there is likely not a full heap
+static bool ggml_vk_heap_has_budget(const vk_device& device, uint32_t memory_type_idx, size_t size) {
+    if (device->idx >= vk_instance.device_supports_membudget.size() || !vk_instance.device_supports_membudget[device->idx]) {
+        return false;
+    }
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget;
+    vk::PhysicalDeviceMemoryProperties2 props = {};
+    props.pNext = &budget;
+    device->physical_device.getMemoryProperties2(&props);
+
+    const uint32_t heap = props.memoryProperties.memoryTypes[memory_type_idx].heapIndex;
+    return budget.heapUsage[heap] + size <= budget.heapBudget[heap];
 }
 
 static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
@@ -131,18 +185,33 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
             bool done = false;
 
             for (auto mtype_it = memory_type_indices.begin(); mtype_it != memory_type_indices.end(); mtype_it++) {
-                try {
+                auto alloc = [&] {
                     buf->device_memory = device->device.allocateMemory({ mem_req.size, *mtype_it, &mem_flags_info });
-                    buf->memory_property_flags = mem_props.memoryTypes[*mtype_it].propertyFlags;
+                };
+                try {
+                    alloc();
                     done = true;
-                    break;
-                } catch (const vk::SystemError& e) {
-                    // loop and retry
-                    // during last attempt throw the exception
-                    if (it + 1 == req_flags_list.end() && mtype_it + 1 == memory_type_indices.end()) {
-                        device->device.destroyBuffer(buf->buffer);
-                        throw e;
+                } catch (const vk::SystemError&) {
+                    const bool last = it + 1 == req_flags_list.end() && mtype_it + 1 == memory_type_indices.end();
+                    const bool device_local = (bool) (mem_props.memoryTypes[*mtype_it].propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal);
+
+                    // a device-local heap with budget left most likely failed on the Windows commit limit,
+                    // so wait for the pagefile to grow before falling back to slower memory; also wait before the last attempt fails
+                    if (last || (device_local && ggml_vk_heap_has_budget(device, *mtype_it, mem_req.size))) {
+                        try {
+                            ggml_vk_retry_on_oom("allocateMemory", alloc);
+                            done = true;
+                        } catch (const vk::SystemError& e) {
+                            if (last) {
+                                device->device.destroyBuffer(buf->buffer);
+                                throw e;
+                            }
+                        }
                     }
+                }
+                if (done) {
+                    buf->memory_property_flags = mem_props.memoryTypes[*mtype_it].propertyFlags;
+                    break;
                 }
             }
 
@@ -535,6 +604,16 @@ void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, si
 
 void ggml_vk_buffer_write(vk_buffer& dst, size_t offset, const void * src, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_write(" << size << ")");
+    // a write through the staging buffer grows it to the write size, and it is kept
+    // write large tensors in chunks to keep the staging buffer small; the AMD Windows driver fails to submit a 1.7 GiB staged copy
+    constexpr size_t max_staged_write = 256ull*1024*1024;
+    if (!(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) && size > max_staged_write) {
+        for (size_t done = 0; done < size; done += max_staged_write) {
+            const size_t n = std::min(max_staged_write, size - done);
+            ggml_vk_buffer_write_2d(dst, offset + done, (const uint8_t *) src + done, n, n, n, 1);
+        }
+        return;
+    }
     ggml_vk_buffer_write_2d(dst, offset, src, size, size, size, 1);
 }
 
