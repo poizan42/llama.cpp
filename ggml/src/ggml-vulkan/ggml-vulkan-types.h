@@ -318,6 +318,7 @@ typedef std::weak_ptr<vk_buffer_struct> vk_buffer_ref;
 struct ggml_backend_vk_buffer_type_context {
     std::string name;
     vk_device device;
+    bool sysmem = false; // allocate from host-visible system memory instead of device-local memory
 };
 
 struct vk_command_buffer {
@@ -1025,6 +1026,10 @@ struct vk_device_struct {
     vk_buffer sync_staging;
 
     ggml_backend_buffer_type buffer_type;
+    // <name>_Sysmem: device buffers in host-visible system memory, for tensors that do not fit device-local memory
+    // returned as an extra buffer type, so it is used only when asked for, e.g. with --override-tensor
+    ggml_backend_buffer_type buffer_type_sysmem;
+    ggml_backend_buffer_type_t extra_bufts[2];
 
     bool disable_fusion;
     bool disable_descriptor_reuse;

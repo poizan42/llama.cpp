@@ -300,6 +300,18 @@ vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     return buf;
 }
 
+vk_buffer ggml_vk_create_buffer_sysmem(vk_device& device, size_t size) {
+    // memory types are tried in order; on AMD UMA devices the first host-visible type is the system memory heap
+    // no cached bit: only the GPU reads the data after the upload
+    try {
+        return ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+    } catch (const vk::SystemError& e) {
+        std::cerr << "ggml_vulkan: System memory allocation of size " << size << " failed." << std::endl;
+        std::cerr << "ggml_vulkan: " << e.what() << std::endl;
+        throw e;
+    }
+}
+
 void ggml_vk_destroy_buffer(vk_buffer& buf) {
     if (buf == nullptr) {
         return;

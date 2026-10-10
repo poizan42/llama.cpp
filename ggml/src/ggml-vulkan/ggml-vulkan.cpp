@@ -4904,6 +4904,13 @@ vk_device ggml_vk_get_device(size_t idx) {
             /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
         };
+        device->buffer_type_sysmem = {
+            /* .iface    = */ ggml_backend_vk_buffer_type_interface,
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
+            /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name + "_Sysmem", device, true },
+        };
+        device->extra_bufts[0] = &device->buffer_type_sysmem;
+        device->extra_bufts[1] = nullptr;
 
         device->fence = device->device.createFence({});
 
@@ -13071,7 +13078,7 @@ ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buff
 
     vk_buffer dev_buffer = nullptr;
     try {
-        dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
+        dev_buffer = ctx->sysmem ? ggml_vk_create_buffer_sysmem(ctx->device, size) : ggml_vk_create_buffer_device(ctx->device, size);
     } catch (const vk::SystemError& e) {
         return nullptr;
     }
@@ -16185,11 +16192,25 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static ggml_backend_buffer_type_t * ggml_backend_vk_device_get_extra_bufts(ggml_backend_dev_t dev) {
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+    return ggml_vk_get_device(ctx->device)->extra_bufts;
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        return (void *) (ggml_backend_dev_get_extra_bufts_t) ggml_backend_vk_device_get_extra_bufts;
+    }
+    return NULL;
+
+    UNUSED(reg);
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

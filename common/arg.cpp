@@ -259,6 +259,17 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // extra buffer types of GPU devices (e.g. Vulkan0_Sysmem) are used only when overridden to, so list them too
+        // the CPU ones are for weight repacking, which the loader selects by itself
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        auto get_extra_bufts = reg && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU
+            ? (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts")
+            : nullptr;
+        if (get_extra_bufts) {
+            for (auto * extra = get_extra_bufts(dev); extra && *extra; ++extra) {
+                buft_list[ggml_backend_buft_name(*extra)] = *extra;
+            }
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {
