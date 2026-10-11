@@ -2596,13 +2596,16 @@ struct llama_model_qwen4exp : public llama_model_base {
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
         // one conv history per cache tensor: delta-net and PLE each have their own
+        // tail_cpys: when set, the copies of the new history into the cache are returned instead of added to the graph,
+        // so the caller can add them after the convolution (the Vulkan backend fuses them into it)
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,
                     ggml_tensor * conv_states_all,
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
-                            int   il);
+                            int   il,
+       std::vector<ggml_tensor *> * tail_cpys = nullptr);
 
         ggml_tensor * build_inp_ple(
   const llama_memory_hybrid_idx_context * mctx_hyb);
