@@ -182,6 +182,10 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // true when the ubatch's n_seqs states are all the states and each is read from its own cell,
+    // so gathering them by s_copy would copy every state onto itself
+    bool s_copy_is_identity(uint32_t n_seqs) const;
+
 private:
     const llama_memory_status status;
 

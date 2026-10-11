@@ -290,6 +290,9 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // every state is read from its own cell: build_rs uses a view of the cache instead of a gather
+    bool s_copy_identity = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

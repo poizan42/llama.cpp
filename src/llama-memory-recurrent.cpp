@@ -1365,6 +1365,20 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
 }
 
+bool llama_memory_recurrent_context::s_copy_is_identity(uint32_t n_seqs) const {
+    // the worst-case graph and the rollback slots (s_copy() resets their index) keep the gather, and so does a ubatch that
+    // zeroes a state (rs_z >= 0): a view of the cache would not depend on the zeroing op
+    if (is_full || mem->n_rs_seq != 0 || mem->n != n_seqs || mem->rs_z >= 0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < mem->n; ++i) {
+        if (mem->cells[i + mem->head].src0 != (int32_t) (i + mem->head)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
