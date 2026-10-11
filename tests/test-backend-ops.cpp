@@ -12180,6 +12180,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 10, false, 2560, bs, 640));
         }
     }
+    // the other MMVQ types in the same expert shapes, for tuning the MUL_MAT_ID MMVQ pipelines
+    for (int bs : {1, 2, 4, 8}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4,
+                                 GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 10, false, 640, bs, 2560));
+            // the down projection's k = 640 is not a multiple of the 256-weight superblocks
+            if (640 % ggml_blck_size(type_a) == 0) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 10, false, 2560, bs, 640));
+            }
+        }
+    }
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {

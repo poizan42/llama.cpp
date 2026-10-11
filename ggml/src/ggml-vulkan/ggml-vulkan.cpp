@@ -2893,7 +2893,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     const bool is_rdna3_or_4 = device->vendor_id == VK_VENDOR_ID_AMD && (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
     // with the AMD proprietary driver, 4 rows above four columns spill registers instead: on a Radeon 890M,
     // 5 columns of Q5_K 2560x6144 take 11x the 1-column time. per-type rows measured there instead
-    const bool amd_prop_manycols = is_rdna3_or_4 && device->driver_id == vk::DriverId::eAmdProprietary;
+    const bool amd_prop = device->driver_id == vk::DriverId::eAmdProprietary;
+    const bool amd_prop_manycols = is_rdna3_or_4 && amd_prop;
     // GGML_VK_MMVQ_ROWS_MANYCOLS overrides the rows above four columns for tuning
     const uint32_t mmvq_rows_manycols = getenv("GGML_VK_MMVQ_ROWS_MANYCOLS") ? (uint32_t) atoi(getenv("GGML_VK_MMVQ_ROWS_MANYCOLS")) : 0;
     auto const &rm_int_n = [&](ggml_type type, uint32_t rows, uint32_t i) {
@@ -2919,7 +2920,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         return is_rdna3_or_4 ? 4u : rows;
     };
     // RDNA3/4 and NVIDIA except pre-Turing: use 4 rows for MUL_MAT_ID MMVQ.
+    // RDNA3 with the AMD proprietary driver: 2 rows, best or within noise for every type on a Radeon 890M
+    // (640x2560 and 2560x640 experts, 1-8 tokens); IQ4_XS -30 to -38% with 2-8 tokens vs 4 rows
+    // GGML_VK_MMVQID_ROWS overrides the rows for tuning
+    const uint32_t mmvqid_rows = getenv("GGML_VK_MMVQID_ROWS") ? (uint32_t) atoi(getenv("GGML_VK_MMVQID_ROWS")) : 0;
     auto const &rm_id = [&](uint32_t rows) {
+        if (mmvqid_rows) {
+            return mmvqid_rows;
+        }
+        if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3 && amd_prop) {
+            return 2u;
+        }
         if (device->vendor_id == VK_VENDOR_ID_NVIDIA &&
             device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) {
             return 4u;
@@ -7802,8 +7813,8 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
             if (src0->type == GGML_TYPE_Q2_0) {
                 return true;  // -39% at k = 640, below the k >= 2048 limit for AMD
             }
-            if (src0->type == GGML_TYPE_IQ4_XS) {
-                return false; // -18% at k = 2560
+            if (src0->type == GGML_TYPE_IQ4_XS && ctx->device->driver_id != vk::DriverId::eAmdProprietary) {
+                return false; // -18% at k = 2560 vs 4-row MMVQ; with the AMD driver's 2-row MMVQ, MMVQ is 8% faster
             }
         }
         return ggml_vk_should_use_mmvq(ctx->device, ne01, ne12, ne10, src0->type);
