@@ -745,9 +745,14 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         pipeline_shader_create_info.setPNext(&pipeline_shader_stage_required_subgroup_size_create_info);
     }
 
+    // GGML_VK_PIPELINE_ISA_DIR: also write the driver's internal representations (ISA) of the pipelines matching GGML_VK_PIPELINE_STATS there
+    const bool capture_ir = device->pipeline_executable_properties_support && vk_pipeline_isa_dir != nullptr &&
+                            !vk_pipeline_stats_filter.empty() && pipeline->name.find(vk_pipeline_stats_filter) != std::string::npos;
+
     vk::ComputePipelineCreateInfo compute_pipeline_create_info(
         device->pipeline_executable_properties_support ?
-            vk::PipelineCreateFlagBits::eCaptureStatisticsKHR :
+            (capture_ir ? vk::PipelineCreateFlagBits::eCaptureStatisticsKHR | vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR :
+                          vk::PipelineCreateFlags(vk::PipelineCreateFlagBits::eCaptureStatisticsKHR)) :
             vk::PipelineCreateFlags{},
         pipeline_shader_create_info,
         pipeline->layout);
@@ -767,6 +772,9 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
         pipelineFlags2CreateInfo.flags = vk::PipelineCreateFlagBits2::e64BitIndexingEXT;
         if (device->pipeline_executable_properties_support) {
             pipelineFlags2CreateInfo.flags |= vk::PipelineCreateFlagBits2::eCaptureStatisticsKHR;
+        }
+        if (capture_ir) {
+            pipelineFlags2CreateInfo.flags |= vk::PipelineCreateFlagBits2::eCaptureInternalRepresentationsKHR;
         }
         pipelineFlags2CreateInfo.setPNext(compute_pipeline_create_info.pNext);
         compute_pipeline_create_info.setPNext(&pipelineFlags2CreateInfo);
@@ -824,6 +832,34 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
                 VK_LOG_DEBUG(pipeline->name << " " << s.name << ": " << s.value.u64 << " registers");
                 pipeline->register_count = (uint32_t)s.value.u64;
             }
+        }
+
+        if (capture_ir) {
+            uint32_t count = 0;
+            (void) device->device.getPipelineExecutableInternalRepresentationsKHR(&executableInfo, &count, nullptr);
+            std::vector<vk::PipelineExecutableInternalRepresentationKHR> irs(count);
+            (void) device->device.getPipelineExecutableInternalRepresentationsKHR(&executableInfo, &count, irs.data());
+            std::vector<std::vector<char>> data(count);
+            for (uint32_t i = 0; i < count; i++) {
+                data[i].resize(irs[i].dataSize);
+                irs[i].pData = data[i].data();
+            }
+            (void) device->device.getPipelineExecutableInternalRepresentationsKHR(&executableInfo, &count, irs.data());
+
+            // the same name is used for several variants (e.g. per column count), so number the files
+            static std::atomic<uint32_t> ir_counter {0};
+            const std::string path = std::string(vk_pipeline_isa_dir) + "/" + pipeline->name + "." + std::to_string(ir_counter++) + ".txt";
+            std::ofstream f(path, std::ios::binary);
+            for (uint32_t i = 0; i < count; i++) {
+                f << "==== " << irs[i].name.data() << ": " << irs[i].description.data() << "\n";
+                if (irs[i].isText) {
+                    f.write(data[i].data(), strnlen(data[i].data(), data[i].size()));
+                } else {
+                    f << "(binary, " << data[i].size() << " bytes)";
+                }
+                f << "\n";
+            }
+            std::cerr << "ggml_vulkan:   internal representations written to " << path << std::endl;
         }
     }
 
@@ -5349,6 +5385,7 @@ void ggml_vk_instance_init() {
     if (GGML_VK_PIPELINE_STATS != nullptr) {
         vk_pipeline_stats_filter = GGML_VK_PIPELINE_STATS;
     }
+    vk_pipeline_isa_dir = getenv("GGML_VK_PIPELINE_ISA_DIR");
     const char* GGML_VK_PERF_LOGGER_FREQUENCY = getenv("GGML_VK_PERF_LOGGER_FREQUENCY");
 
     if (GGML_VK_PERF_LOGGER_FREQUENCY != nullptr) {

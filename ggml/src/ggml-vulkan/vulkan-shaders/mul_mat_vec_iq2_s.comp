@@ -27,22 +27,26 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
             // read the grid from the constant array: copying the 8 KB table to shared memory in every workgroup
             // cost more than the lookups (-17% dense, -14% MUL_MAT_ID on a Radeon 890M; the 1-2 KB iq3 tables are faster in shared memory)
             const uvec2 grid = iq2s_grid_const[qs];
-            const vec4 grid0 = vec4(unpack8(grid.x));
-            const vec4 grid1 = vec4(unpack8(grid.y));
+            // apply the signs to the packed bytes: spread 4 sign bits to the byte LSBs, negate those bytes as (g ^ 0xFF) + 1
+            // (grid values are at most 43, so no byte carries), then convert as signed bytes
+            const uint m0 = ((uint(sign) & 0xF) * 0x00204081u) & 0x01010101u;
+            const uint m1 = ((uint(sign) >> 4) * 0x00204081u) & 0x01010101u;
+            const vec4 grid0 = vec4(unpack8(int32_t((grid.x ^ (m0 * 0xFF)) + m0)));
+            const vec4 grid1 = vec4(unpack8(int32_t((grid.y ^ (m1 * 0xFF)) + m1)));
 
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                 vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
                 vec4 b4 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
 
                 FLOAT_TYPE sum =
-                      fma(FLOAT_TYPE(b0.x), FLOAT_TYPE((sign &   1) != 0 ? -grid0.x : grid0.x),
-                      fma(FLOAT_TYPE(b0.y), FLOAT_TYPE((sign &   2) != 0 ? -grid0.y : grid0.y),
-                      fma(FLOAT_TYPE(b0.z), FLOAT_TYPE((sign &   4) != 0 ? -grid0.z : grid0.z),
-                      fma(FLOAT_TYPE(b0.w), FLOAT_TYPE((sign &   8) != 0 ? -grid0.w : grid0.w),
-                      fma(FLOAT_TYPE(b4.x), FLOAT_TYPE((sign &  16) != 0 ? -grid1.x : grid1.x),
-                      fma(FLOAT_TYPE(b4.y), FLOAT_TYPE((sign &  32) != 0 ? -grid1.y : grid1.y),
-                      fma(FLOAT_TYPE(b4.z), FLOAT_TYPE((sign &  64) != 0 ? -grid1.z : grid1.z),
-                      fma(FLOAT_TYPE(b4.w), FLOAT_TYPE((sign & 128) != 0 ? -grid1.w : grid1.w),
+                      fma(FLOAT_TYPE(b0.x), FLOAT_TYPE(grid0.x),
+                      fma(FLOAT_TYPE(b0.y), FLOAT_TYPE(grid0.y),
+                      fma(FLOAT_TYPE(b0.z), FLOAT_TYPE(grid0.z),
+                      fma(FLOAT_TYPE(b0.w), FLOAT_TYPE(grid0.w),
+                      fma(FLOAT_TYPE(b4.x), FLOAT_TYPE(grid1.x),
+                      fma(FLOAT_TYPE(b4.y), FLOAT_TYPE(grid1.y),
+                      fma(FLOAT_TYPE(b4.z), FLOAT_TYPE(grid1.z),
+                      fma(FLOAT_TYPE(b4.w), FLOAT_TYPE(grid1.w),
                       FLOAT_TYPE(0.0)))))))));
                 temp[j][n] = fma(db, sum, temp[j][n]);
             }
