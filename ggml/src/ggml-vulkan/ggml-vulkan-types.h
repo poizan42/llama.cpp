@@ -558,6 +558,10 @@ static constexpr std::initializer_list<ggml_op> rms_norm_view_set_rows_pattern {
 
 static constexpr std::initializer_list<ggml_op> rope_view_set_rows_pattern { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
+// gated delta net + the copy of its final state into the recurrent cache (with and without the VIEW of the cache)
+static constexpr std::initializer_list<ggml_op> gdn_view_view_cpy_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
+static constexpr std::initializer_list<ggml_op> gdn_view_cpy_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_CPY };
+
 // scale_out*sigmoid(scale_in*x) as the hc_post weights (qwen4exp hc_combine)
 static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
 
@@ -1310,6 +1314,8 @@ struct ggml_backend_vk_context {
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
+    // GATED_DELTA_NET fused with the copy of its final state: the copy's destination
+    const ggml_tensor * fused_gdn_state_dst {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER
