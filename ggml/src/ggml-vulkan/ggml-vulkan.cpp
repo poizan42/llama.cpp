@@ -3526,6 +3526,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ ## name [0], #name "_f32", name ## _f32_len, name ## _f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);  \
     ggml_vk_create_pipeline(device, device->pipeline_ ## name [1], #name "_f16", name ## _f16_len, name ## _f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
+    ggml_vk_create_pipeline(device, device->pipeline_scale_silu_f32, "scale_silu_f32", scale_silu_f32_len, scale_silu_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+
     CREATE_UNARY(elu)
     CREATE_UNARY(gelu)
     CREATE_UNARY(gelu_erf)
@@ -10658,6 +10660,15 @@ void ggml_vk_scale(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_SCALE, std::move(p));
 }
 
+// SCALE followed by SILU: silu(x * scale + bias) in one dispatch
+void ggml_vk_scale_silu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * scale, ggml_tensor * dst) {
+    vk_op_unary_push_constants p = vk_op_unary_push_constants_init(src0, dst);
+    p.param1 = ggml_get_op_params_f32(scale, 0);
+    p.param2 = ggml_get_op_params_f32(scale, 1);
+
+    ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_UNARY, std::move(p), ctx->device->pipeline_scale_silu_f32);
+}
+
 void ggml_vk_sqr(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_SQR, vk_op_unary_push_constants_init(src0, dst));
 }
@@ -12603,6 +12614,8 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         if (ctx->fused_hc_post_gate) {
             ggml_tensor * hc_post = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
             ggml_vk_dsv4_hc_post(ctx, compute_ctx, hc_post->src[0], hc_post->src[1], hc_post->src[2], hc_post->src[3], hc_post, node);
+        } else if (ctx->fused_scale_silu) {
+            ggml_vk_scale_silu(ctx, compute_ctx, src0, node, cgraph->nodes[node_idx + 1]);
         } else {
             ggml_vk_scale(ctx, compute_ctx, src0, node);
         }
@@ -13892,6 +13905,15 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
     return true;
 }
 
+// SCALE followed by SILU (the hyper-connection mix): silu(x * scale + bias) in one dispatch
+static bool ggml_vk_can_fuse_scale_silu(const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * scale = cgraph->nodes[node_idx];
+    const ggml_tensor * silu  = cgraph->nodes[node_idx + 1];
+    return silu->src[0] == scale && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
+           scale->src[0]->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 &&
+           ggml_are_same_shape(scale->src[0], silu);
+}
+
 // GATED_DELTA_NET with one state slot, followed by the copy of its final state into the recurrent cache
 // (VIEW of the state part of its dst, optionally the VIEW of the cache, CPY): the kernel can write the state there itself.
 // returns the number of nodes after the GDN node to fuse, 0 if the pattern does not match
@@ -14651,6 +14673,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_gate = false;
         ctx->fused_gdn_state_dst = nullptr;
         ctx->fused_conv_state = false;
+        ctx->fused_scale_silu = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
@@ -14731,6 +14754,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_rms_norm_mode = RMS_NORM_VIEW_SET_ROWS;
                 fusion_string = "RMS_NORM_VIEW_SET_ROWS";
                 std::fill_n(op_srcs_fused_elementwise, 3, false);
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }) && ggml_vk_can_fuse_scale_silu(cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_scale_silu = true;
+                fusion_string = "SCALE_SILU";
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 ctx->fused_rms_norm_mode = RMS_NORM_MUL;
@@ -14911,6 +14940,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_gdn_state_dst = nullptr;
                 ctx->fused_conv_state = false;
+                ctx->fused_scale_silu = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
@@ -15303,6 +15333,26 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             if (is_empty(graph->nodes[j])) {
                 continue;
             }
+            // Hold back a UNARY whose fusable MUL consumer still waits for its other input (the gated delta net's
+            // sigmoid(z) * norm): grabbed early, it runs alone and the UNARY + MUL fusion is lost
+            if (graph->nodes[j]->op == GGML_OP_UNARY) {
+                bool wait_for_mul = false;
+                for (int k = j + 1; k < std::min(j + 15, graph->n_nodes); ++k) {
+                    const ggml_tensor * mul = graph->nodes[k];
+                    if (used[k] || mul->op != GGML_OP_MUL || (mul->src[0] != graph->nodes[j] && mul->src[1] != graph->nodes[j])) {
+                        continue;
+                    }
+                    const ggml_tensor * other = (mul->src[0] == graph->nodes[j]) ? mul->src[1] : mul->src[0];
+                    if (other->op != GGML_OP_NONE && used_node_set.find(const_cast<ggml_tensor *>(other)) == used_node_set.end() &&
+                        ggml_vk_can_fuse_unary_mul(graph, j, k)) {
+                        wait_for_mul = true;
+                    }
+                    break;
+                }
+                if (wait_for_mul) {
+                    continue;
+                }
+            }
             // Protect every interior QSA node (not just the start): the mask branch is
             // independent, so it gets pulled out and breaks keep_pattern otherwise.
             auto const &in_qsa_pattern = [&](int n) -> bool {
@@ -15337,6 +15387,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 if (!used[c] &&
                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
+                    !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_SCALE && graph->nodes[j]->op == GGML_OP_UNARY && empty_or_scheduled_between(c+1, j)) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
@@ -16910,6 +16961,29 @@ std::string vk_perf_logger::get_node_fusion_name(const ggml_tensor * node, const
     std::string fusion_str;
     if (fusion_name) {
         fusion_str = fusion_name + std::string(" ");
+    }
+    static const bool log_names = getenv("GGML_VK_PERF_LOGGER_NAMES") != nullptr;
+    if (log_names && node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+        // GGML_VK_PERF_LOGGER_NAMES: name every op by its tensor name and its first source (layer numbers dropped),
+        // to map small ops to the model graph
+        std::string tname = node->name;
+        const size_t dash = tname.find_last_of('-');
+        if (dash != std::string::npos && dash + 1 < tname.size() && tname.find_first_not_of("0123456789", dash + 1) == std::string::npos) {
+            tname.resize(dash);
+        }
+        if (tname.rfind("node_", 0) == 0) {
+            tname = "node";
+        }
+        std::string opn = node->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(node)) : ggml_op_name(node->op);
+        std::string src0n = node->src[0] ? node->src[0]->name : "";
+        const size_t d0 = src0n.find_last_of('-');
+        if (d0 != std::string::npos) {
+            src0n.resize(d0);
+        }
+        if (src0n.rfind("node_", 0) == 0) {
+            src0n = "node(" + std::string(node->src[0]->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(node->src[0])) : ggml_op_name(node->src[0]->op)) + ")";
+        }
+        return fusion_str + opn + " " + tname + " <- " + src0n;
     }
     if (node->op == GGML_OP_UNARY) {
         return fusion_str + ggml_unary_op_name(ggml_get_unary_op(node));

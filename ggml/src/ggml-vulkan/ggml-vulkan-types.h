@@ -900,6 +900,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_gelu_erf[2];
     vk_pipeline pipeline_gelu_quick[2];
     vk_pipeline pipeline_silu[2];
+    // SCALE + SILU
+    vk_pipeline pipeline_scale_silu_f32;
     vk_pipeline pipeline_relu[2];
     vk_pipeline pipeline_sqr[2];
     vk_pipeline pipeline_sqrt[2];
@@ -1324,6 +1326,8 @@ struct ggml_backend_vk_context {
     const ggml_tensor * fused_gdn_state_dst {};
     // CONCAT + SSM_CONV + SILU + the copy of the new conv history (ggml_vk_ssm_conv_state)
     bool fused_conv_state {};
+    // SCALE followed by SILU
+    bool fused_scale_silu {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

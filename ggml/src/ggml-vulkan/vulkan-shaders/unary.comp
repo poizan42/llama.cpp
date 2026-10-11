@@ -91,6 +91,11 @@ float op_silu(float x) {
     return x / (1.0f + exp(-x));
 }
 
+// SCALE fused into SILU: the same x * scale + bias as scale.comp
+float op_scale_silu(float x) {
+    return op_silu(x * p.param1 + p.param2);
+}
+
 float op_hardswish(float x) {
     return x * min(1.0f, max(0.0f, (x + 3.0f) / 6.0f));
 }
