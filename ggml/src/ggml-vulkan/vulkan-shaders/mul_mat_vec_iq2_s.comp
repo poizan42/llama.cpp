@@ -24,7 +24,9 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
         [[unroll]] for (uint l = 0; l < 2; ++l) {
             const uint8_t sign = sign16[l];
             const uint qs = qs16[l] | ((qh << (8 - nibble_shift - 2 * l)) & 0x300);
-            const uvec2 grid = iq2s_grid[qs];
+            // read the grid from the constant array: copying the 8 KB table to shared memory in every workgroup
+            // cost more than the lookups (-17% dense, -14% MUL_MAT_ID on a Radeon 890M; the 1-2 KB iq3 tables are faster in shared memory)
+            const uvec2 grid = iq2s_grid_const[qs];
             const vec4 grid0 = vec4(unpack8(grid.x));
             const vec4 grid1 = vec4(unpack8(grid.y));
 
@@ -76,7 +78,6 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 void main() {
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 
-    init_iq_shmem(gl_WorkGroupSize);
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
     if (first_row + NUM_ROWS <= p.stride_d) {
