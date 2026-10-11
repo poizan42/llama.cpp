@@ -2903,7 +2903,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     uint32_t rm_iq = 2 * rm_kq;
 
     // rows per workgroup and subgroup size of the IQ MUL_MAT_ID mat-vec pipelines
-    // RDNA3 values were measured on a Radeon 890M (RDNA3.5) with 640x2560 and 2560x640 experts, one token
+    // RDNA3: 2 rows, measured on a Radeon 890M (RDNA3.5) with 640x2560 and 2560x640 experts, one token
+    // (vs 4 rows: IQ2_S -5%, IQ4_XS -16%, IQ4_NL -10%, the others within noise)
     // GGML_VK_MMVID_ROWS and GGML_VK_MMVID_SG override them for tuning
     const uint32_t mmvid_rows = getenv("GGML_VK_MMVID_ROWS") ? (uint32_t) atoi(getenv("GGML_VK_MMVID_ROWS")) : 0;
     const uint32_t mmvid_sg   = getenv("GGML_VK_MMVID_SG")   ? (uint32_t) atoi(getenv("GGML_VK_MMVID_SG"))   : 0;
@@ -2914,9 +2915,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         if (rdna3) {
             switch (type) {
+                case GGML_TYPE_IQ2_S:
                 case GGML_TYPE_IQ3_S:
-                case GGML_TYPE_IQ3_XXS: return 2u; // -10%
-                case GGML_TYPE_IQ4_NL:  return 8u; // -19% with subgroup size 32
+                case GGML_TYPE_IQ3_XXS:
+                case GGML_TYPE_IQ4_XS:
+                case GGML_TYPE_IQ4_NL: return 2u;
                 default: break;
             }
         }
@@ -2951,11 +2954,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const uint32_t wg_size_subgroup   = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size : (subgroup_size * 4);
         const uint32_t wg_size_subgroup16 = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size16 : (subgroup_size16 * 4);
         auto const &sg_iq_id = [&](ggml_type type) -> uint32_t {
+            GGML_UNUSED(type);
             if (mmvid_sg && device->subgroup_size_control) {
                 return mmvid_sg;
-            }
-            if (rdna3 && type == GGML_TYPE_IQ4_NL && device->subgroup_size_control && device->subgroup_min_size <= 32) {
-                return 32u;
             }
             return subgroup_size16;
         };
