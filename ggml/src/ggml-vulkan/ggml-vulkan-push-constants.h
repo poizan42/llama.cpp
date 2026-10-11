@@ -721,6 +721,16 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+// ssm_conv_state.comp, strides in floats
+struct vk_op_ssm_conv_state_push_constants {
+    uint32_t nc, nr;
+    uint32_t st_nb1, st_nb2;
+    uint32_t w_nb1;
+    uint32_t x_nb1, x_nb2;
+    uint32_t dst_nb2;
+    uint32_t so_nb1, so_nb2;
+};
+
 struct vk_op_conv2d_push_constants {
     uint32_t Cout;
     uint32_t Cin;

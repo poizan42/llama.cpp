@@ -562,6 +562,10 @@ static constexpr std::initializer_list<ggml_op> rope_view_set_rows_pattern { GGM
 static constexpr std::initializer_list<ggml_op> gdn_view_view_cpy_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
 static constexpr std::initializer_list<ggml_op> gdn_view_cpy_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_CPY };
 
+// conv history + new token, ssm_conv + silu, and the copy of the new history into the cache (with and without the cache VIEW)
+static constexpr std::initializer_list<ggml_op> conv_state_view_view_cpy_pattern { GGML_OP_CONCAT, GGML_OP_SSM_CONV, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
+static constexpr std::initializer_list<ggml_op> conv_state_view_cpy_pattern { GGML_OP_CONCAT, GGML_OP_SSM_CONV, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_CPY };
+
 // scale_out*sigmoid(scale_in*x) as the hc_post weights (qwen4exp hc_combine)
 static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
 
@@ -996,6 +1000,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    // CONCAT + SSM_CONV + SILU + the copy of the new conv history, one token
+    vk_pipeline pipeline_ssm_conv_state_silu_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1316,6 +1322,8 @@ struct ggml_backend_vk_context {
     bool fused_hc_post_gate {};
     // GATED_DELTA_NET fused with the copy of its final state: the copy's destination
     const ggml_tensor * fused_gdn_state_dst {};
+    // CONCAT + SSM_CONV + SILU + the copy of the new conv history (ggml_vk_ssm_conv_state)
+    bool fused_conv_state {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

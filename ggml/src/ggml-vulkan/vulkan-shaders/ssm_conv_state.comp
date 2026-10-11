@@ -1,0 +1,72 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// CONCAT(conv history, x) + SSM_CONV + SILU + the copy of the new history into the cache, for one token per sequence.
+// One invocation per (channel, sequence) reads its nc - 1 history values and the new input, writes the conv output and
+// the shifted history. The history may be read from and written to the same cache row: every invocation reads its own
+// values before it writes them.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 64;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer State    { float state[];     };
+layout(binding = 1) readonly buffer Weights  { float weights[];   };
+layout(binding = 2) readonly buffer X        { float x[];         };
+layout(binding = 3)          buffer Dst      { float dst[];       };
+layout(binding = 4)          buffer StateOut { float state_out[]; };
+
+// strides in floats
+layout(push_constant) uniform PushConstants {
+    uint nc;            // kernel size; the history holds nc - 1 values per channel
+    uint nr;            // channels
+    uint st_nb1, st_nb2;
+    uint w_nb1;
+    uint x_nb1, x_nb2;
+    uint dst_nb2;
+    uint so_nb1, so_nb2;
+};
+
+const uint MAX_NC = 8;
+
+void main() {
+    const uint i1 = gl_GlobalInvocationID.x;
+    const uint i3 = gl_WorkGroupID.z;
+
+    if (i1 >= nr) {
+        return;
+    }
+
+    float window[MAX_NC];
+    const uint st_base = i3 * st_nb2 + i1 * st_nb1;
+    [[unroll]] for (uint k = 0; k < MAX_NC - 1; ++k) {
+        if (k < nc - 1) {
+            window[k] = state[st_base + k];
+        }
+    }
+    window[nc - 1] = x[i3 * x_nb2 + i1 * x_nb1];
+
+    // the same arithmetic as ssm_conv.comp, so the fused result is bit-identical
+    float sum = 0.0;
+    const uint w_base = i1 * w_nb1;
+    if (nc == 4) {
+        sum = dot(vec4(window[0], window[1], window[2], window[3]),
+                  vec4(weights[w_base], weights[w_base + 1], weights[w_base + 2], weights[w_base + 3]));
+    } else {
+        [[unroll]] for (uint k = 0; k < MAX_NC; ++k) {
+            if (k < nc) {
+                sum += window[k] * weights[w_base + k];
+            }
+        }
+    }
+    sum = sum / (1.0f + exp(-sum));
+    dst[i3 * dst_nb2 + i1] = sum;
+
+    const uint so_base = i3 * so_nb2 + i1 * so_nb1;
+    [[unroll]] for (uint k = 0; k < MAX_NC - 1; ++k) {
+        if (k < nc - 1) {
+            state_out[so_base + k] = window[k + 1];
+        }
+    }
+}
