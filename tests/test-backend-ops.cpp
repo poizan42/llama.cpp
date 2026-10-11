@@ -10967,6 +10967,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
+    // IQ mat-vec with qwen3.8-flash-next expert shapes (k = 2560 gate/up, k = 640 down), scaled down:
+    // odd row counts for the row tails, k not a multiple of 256 for IQ4_NL, and one and two tokens
+    for (int n : {1, 2}) {
+        for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 10, false, 130, n, 2560));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 131, n, 2560, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 16, 10, false, 261, n, 640));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 16, 10, false, 67, n, 224));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 263, n, 640, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 69, n, 224, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 131, n, 2560, {1, 1}, {1, 1}));
+    }
+
     // multiple blocks per row: exercises the block-stride loop and the
     // per-expert base offset, which k == 256 alone leaves untested
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
@@ -12149,6 +12163,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type type_a : {GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6144, bs, 2560, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2560, bs, 6144, {1, 1}, {1, 1}));
+        }
+        // the routed-expert types as dense mat-vecs, to separate decode cost from the MUL_MAT_ID overhead
+        for (ggml_type type_a : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6144, bs, 2560, {1, 1}, {1, 1}));
         }
         // hyper-connection low-rank matrices
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 10240, bs, 320, {1, 1}, {1, 1}));
