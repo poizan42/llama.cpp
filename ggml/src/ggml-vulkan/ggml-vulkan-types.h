@@ -1004,6 +1004,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     // CONCAT + SSM_CONV + SILU + the copy of the new conv history, one token
     vk_pipeline pipeline_ssm_conv_state_silu_f32;
+    // ADD of a per-row bias + SOFTPLUS + MUL by a per-row factor
+    vk_pipeline pipeline_add_softplus_mul_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1328,6 +1330,8 @@ struct ggml_backend_vk_context {
     bool fused_conv_state {};
     // SCALE followed by SILU
     bool fused_scale_silu {};
+    // ADD + SOFTPLUS + MUL (ggml_vk_add_softplus_mul)
+    bool fused_add_softplus_mul {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

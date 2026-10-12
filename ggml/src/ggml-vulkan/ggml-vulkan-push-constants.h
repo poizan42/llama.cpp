@@ -722,6 +722,11 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+// add_softplus_mul.comp
+struct vk_op_add_softplus_mul_push_constants {
+    uint32_t ne, ne0;
+};
+
 // ssm_conv_state.comp, strides in floats
 struct vk_op_ssm_conv_state_push_constants {
     uint32_t nc, nr;
