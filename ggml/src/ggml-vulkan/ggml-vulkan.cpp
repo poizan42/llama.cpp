@@ -10348,7 +10348,9 @@ void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx
 void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
-    const ggml_tensor * src_beta  = dst->src[4];
+    // fused UNARY SIGMOID of beta: bind its input, the kernel applies the sigmoid
+    const bool beta_sigmoid = ctx->fused_gdn_beta_sigmoid != 0;
+    const ggml_tensor * src_beta  = beta_sigmoid ? dst->src[4]->src[0] : dst->src[4];
 
     GGML_ASSERT(dst->buffer != nullptr);
 
@@ -10370,7 +10372,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer src_buf[6] = {};
     for (int i = 0; i < 6; i++) {
-        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, i == 4 ? src_beta : dst->src[i]);
     }
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
@@ -10400,6 +10402,7 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         scale,
         K,
         state_dst ? 0u : s_off,
+        beta_sigmoid ? 1u : 0u,
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -12719,6 +12722,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_UNARY:
+        if (ctx->fused_gdn_beta_sigmoid) {
+            // the beta sigmoid fused into the GATED_DELTA_NET further on in the fused range
+            ggml_vk_gated_delta_net(ctx, compute_ctx, cgraph->nodes[node_idx + ctx->fused_gdn_beta_sigmoid]);
+            break;
+        }
         if (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT) {
             ggml_vk_topk_moe(ctx, compute_ctx, cgraph, node_idx);
             break;
@@ -13934,6 +13942,28 @@ static bool ggml_vk_can_fuse_scale_silu(const struct ggml_cgraph * cgraph, int n
            ggml_are_same_shape(scale->src[0], silu);
 }
 
+// UNARY SIGMOID whose only use is the beta of a GATED_DELTA_NET a few nodes on, with only views in between: the GDN kernel
+// applies the sigmoid to its input itself. Returns the GDN's distance from the sigmoid, 0 if no match
+static int ggml_vk_can_fuse_gdn_beta_sigmoid(const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * sig = cgraph->nodes[node_idx];
+    if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+        sig->type != GGML_TYPE_F32 || sig->src[0]->type != GGML_TYPE_F32 ||
+        (sig->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, node_idx) != 1 ||
+        !ggml_are_same_shape(sig, sig->src[0]) || !ggml_is_contiguous(sig) || !ggml_is_contiguous(sig->src[0])) {
+        return 0;
+    }
+    for (int k = node_idx + 1; k < std::min(node_idx + 8, cgraph->n_nodes); ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n->op == GGML_OP_GATED_DELTA_NET) {
+            return n->src[4] == sig && n->type == GGML_TYPE_F32 ? k - node_idx : 0;
+        }
+        if (n->op != GGML_OP_NONE && n->op != GGML_OP_VIEW && n->op != GGML_OP_RESHAPE && n->op != GGML_OP_PERMUTE && n->op != GGML_OP_TRANSPOSE) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
 // GATED_DELTA_NET with one state slot, followed by the copy of its final state into the recurrent cache
 // (VIEW of the state part of its dst, optionally the VIEW of the cache, CPY): the kernel can write the state there itself.
 // returns the number of nodes after the GDN node to fuse, 0 if the pattern does not match
@@ -14723,6 +14753,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_gdn_state_dst = nullptr;
+        ctx->fused_gdn_beta_sigmoid = 0;
         ctx->fused_conv_state = false;
         ctx->fused_scale_silu = false;
         ctx->fused_add_softplus_mul = false;
@@ -14844,6 +14875,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "CONCAT_SSM_CONV_SILU_CPY";
                 // every invocation reads its own history values before it writes them, so the history may alias the cache
                 std::fill_n(op_srcs_fused_elementwise, n + 1, true);
+            } else if (int d = ggml_vk_can_fuse_gdn_beta_sigmoid(cgraph, i)) {
+                const int n = ggml_vk_can_fuse_gdn_state_cpy(cgraph, i + d);
+                ctx->num_additional_fused_ops = d + n;
+                ctx->fused_gdn_beta_sigmoid = d;
+                ctx->fused_gdn_state_dst = n ? cgraph->nodes[i + d + n] : nullptr;
+                // the GDN node's own dst (the attention output) is written
+                ctx->fused_ops_write_mask |= 1 << d;
+                fusion_string = n ? "SIGMOID_GDN_STATE_CPY" : "SIGMOID_GDN";
+                std::fill_n(op_srcs_fused_elementwise, d + n + 1, true);
             } else if (int n = ggml_vk_can_fuse_gdn_state_cpy(cgraph, i)) {
                 ctx->num_additional_fused_ops = n;
                 ctx->fused_gdn_state_dst = cgraph->nodes[i + n];
@@ -14997,6 +15037,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_gdn_state_dst = nullptr;
+                ctx->fused_gdn_beta_sigmoid = 0;
                 ctx->fused_conv_state = false;
                 ctx->fused_scale_silu = false;
                 ctx->fused_add_softplus_mul = false;
@@ -15355,6 +15396,52 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
         };
 
+        // the GATED_DELTA_NET whose beta is node s, a SIGMOID; -1 if none close by
+        auto const &gdn_of_beta = [&](int s) -> int {
+            if (graph->nodes[s]->op != GGML_OP_UNARY || ggml_get_unary_op(graph->nodes[s]) != GGML_UNARY_OP_SIGMOID) {
+                return -1;
+            }
+            for (int k = s + 1; k < std::min(s + 20, graph->n_nodes); ++k) {
+                if (graph->nodes[k]->op == GGML_OP_GATED_DELTA_NET && graph->nodes[k]->src[4] == graph->nodes[s]) {
+                    return k;
+                }
+            }
+            return -1;
+        };
+        // whether all inputs of GDN node g other than its beta s are computed (scheduled before, or in this set)
+        auto const &gdn_inputs_ready = [&](int g, int s) -> bool {
+            for (uint32_t i = 0; i < GGML_MAX_SRC; ++i) {
+                const ggml_tensor * r = graph->nodes[g]->src[i];
+                if (!r || r == graph->nodes[s]) {
+                    continue;
+                }
+                while (r->op != GGML_OP_NONE && is_empty(r) && r->src[0]) {
+                    r = r->src[0];
+                }
+                if (r->op == GGML_OP_NONE || used_node_set.find(const_cast<ggml_tensor *>(r)) != used_node_set.end()) {
+                    continue;
+                }
+                bool in_set = false;
+                for (int c : current_set) {
+                    in_set |= graph->nodes[c] == r;
+                }
+                if (!in_set) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        // a beta SIGMOID was scheduled: pull its GDN (and the GDN's state copy) right behind it so they fuse
+        auto const &pull_gdn_beta = [&](int s) {
+            const int g = gdn_of_beta(s);
+            if (g == -1 || used[g] || !gdn_inputs_ready(g, s)) {
+                return;
+            }
+            current_set.push_back(g);
+            used[g] = true;
+            pull_gdn_state_cpy(g);
+        };
+
         if (keep_topk_moe_pattern(topk_moe_early_softmax_norm)) {
             continue;
         }
@@ -15409,6 +15496,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
         pull_gdn_state_cpy(first_unused);
         pull_conv_state(first_unused);
         pull_add_softplus_mul(first_unused);
+        pull_gdn_beta(first_unused);
 
         // Loop through the next N nodes. Grab any that don't depend on other nodes that
         // haven't already been run. Nodes that have already been run have used[i] set
@@ -15426,6 +15514,13 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
             // Hold back a UNARY whose fusable MUL consumer still waits for its other input (the gated delta net's
             // sigmoid(z) * norm): grabbed early, it runs alone and the UNARY + MUL fusion is lost
+            // likewise hold back a beta SIGMOID until its GATED_DELTA_NET can follow it
+            if (graph->nodes[j]->op == GGML_OP_UNARY) {
+                const int g = gdn_of_beta(j);
+                if (g != -1 && !gdn_inputs_ready(g, j)) {
+                    continue;
+                }
+            }
             if (graph->nodes[j]->op == GGML_OP_UNARY) {
                 bool wait_for_mul = false;
                 for (int k = j + 1; k < std::min(j + 15, graph->n_nodes); ++k) {
@@ -15495,6 +15590,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 pull_gdn_state_cpy(j);
                 pull_conv_state(j);
                 pull_add_softplus_mul(j);
+                pull_gdn_beta(j);
 
                 int rope_idx = j;
 

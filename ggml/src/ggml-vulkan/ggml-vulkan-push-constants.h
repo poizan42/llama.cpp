@@ -704,6 +704,8 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
     // K == 1: offset of the final state in the state output binding (s_off into dst, or 0 when fused with its copy to the cache)
     uint32_t state_out_off;
+    // beta is bound before its sigmoid, which the kernel applies (fused UNARY SIGMOID)
+    uint32_t beta_sigmoid;
 };
 
 struct vk_op_ssm_scan_push_constants {

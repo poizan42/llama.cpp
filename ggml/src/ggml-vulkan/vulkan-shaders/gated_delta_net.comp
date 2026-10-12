@@ -33,6 +33,8 @@ layout(push_constant) uniform Parameters {
     float scale;
     uint K;
     uint state_out_off;
+    // beta holds the logits: apply the sigmoid here (fused UNARY SIGMOID, same formula as unary.comp)
+    uint beta_sigmoid;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -127,7 +129,10 @@ void main() {
         const uint k_off = q_off;
         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
         const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
-        const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+        FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+        if (beta_sigmoid != 0u) {
+            beta_val = FLOAT_TYPE(1.0f / (1.0f + exp(-float(beta_val))));
+        }
 
         FLOAT_TYPE k_reg[ROWS_PER_LANE];
         FLOAT_TYPE q_reg[ROWS_PER_LANE];

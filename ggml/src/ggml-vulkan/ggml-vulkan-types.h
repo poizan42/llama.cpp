@@ -1326,6 +1326,8 @@ struct ggml_backend_vk_context {
     bool fused_hc_post_gate {};
     // GATED_DELTA_NET fused with the copy of its final state: the copy's destination
     const ggml_tensor * fused_gdn_state_dst {};
+    // UNARY SIGMOID of beta fused into the following GATED_DELTA_NET: the GDN's position in the fused range (0 = not fused)
+    int fused_gdn_beta_sigmoid {};
     // CONCAT + SSM_CONV + SILU + the copy of the new conv history (ggml_vk_ssm_conv_state)
     bool fused_conv_state {};
     // SCALE followed by SILU
