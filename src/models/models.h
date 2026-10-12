@@ -2595,6 +2595,16 @@ struct llama_model_qwen4exp : public llama_model_base {
         // build_rs writes the state tensor in place, so one gather per cache tensor is reused
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
+        // the parts of build_qsa_sel that are the same in every attention layer, built once per graph
+        struct qsa_shared {
+            const void *  key       = nullptr; // the k-pool input they were built for
+            ggml_tensor * pzero     = nullptr; // zero half of the packed indexer cache rows
+            ggml_tensor * weights   = nullptr; // indexer head weights
+            ggml_tensor * zeros     = nullptr; // the values scattered into the selection mask
+            ggml_tensor * live_tail = nullptr; // 1 for tail cells that exist, 0 for the n_kv sentinel
+            ggml_tensor * dump      = nullptr; // dump row n_kv + slot of every selection slot
+        } qsa;
+
         // one conv history per cache tensor: delta-net and PLE each have their own
         // tail_cpys: when set, the copies of the new history into the cache are returned instead of added to the graph,
         // so the caller can add them after the convolution (the Vulkan backend fuses them into it)
